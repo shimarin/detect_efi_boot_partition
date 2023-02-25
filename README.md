@@ -6,7 +6,7 @@ A command line tool to find EFI boot partition and print its device name
 ### Runtime
 
 - Linux kernel with CONFIG_EFI_VARS (runtime)
-- System have booted via EFI(not BIOS)
+- System booted via EFI(not BIOS)
 - [util-linux](https://github.com/util-linux/util-linux)
 
 ### Build time
