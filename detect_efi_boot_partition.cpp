@@ -18,7 +18,8 @@
 
 #include <argparse/argparse.hpp>
 
-static std::optional<std::filesystem::path> search_partition(const std::string& key, const std::string& value)
+static std::optional<std::filesystem::path>
+    search_partition(const std::string& key, const std::string& value)
 {
     blkid_cache _cache;
     if (blkid_get_cache(&_cache, "/dev/null") < 0) throw std::runtime_error("blkid_get_cache() failed");
@@ -38,113 +39,129 @@ static std::optional<std::filesystem::path> search_partition(const std::string& 
     return {}; // not found
 }
 
-template <typename T> T read(int fd)
+typedef std::shared_ptr<int> auto_fd;
+
+static auto_fd open(const std::filesystem::path& path, int flags = O_RDONLY)
+{
+    auto_fd fd(
+        new int(::open(path.c_str(), flags)),
+        [](int* fd) {if (fd) { if (*fd >= 0) close(*fd); delete fd; }}
+    );
+    //else
+    return (fd && *fd >= 0)? fd : auto_fd(nullptr);
+}
+
+inline void read(auto_fd fd, void* buf, size_t size)
+{
+    if (!fd) throw std::runtime_error("File descriptor invalid");
+    auto r = ::read(*fd, buf, size);
+    if (r < (ssize_t)size) throw std::runtime_error("Boundary exceeded(EFI bug?)");
+}
+
+template <typename T> T read(auto_fd fd)
 {
     T buf;
-    auto r = read(fd, &buf, sizeof(buf));
-    if (r < (ssize_t)sizeof(buf)) throw std::runtime_error("Boundary exceeded(EFI bug?)");
+    read(fd, &buf, sizeof(buf));
     return buf;
 }
 
-inline uint16_t read_le16(int fd) { return le16toh(read<uint16_t>(fd)); }
-inline uint32_t read_le32(int fd) { return le32toh(read<uint32_t>(fd)); }
+inline uint16_t read_le16(auto_fd fd) { return le16toh(read<uint16_t>(fd)); }
+inline uint32_t read_le32(auto_fd fd) { return le32toh(read<uint32_t>(fd)); }
+inline uint64_t read_le64(auto_fd fd) { return le64toh(read<uint64_t>(fd)); }
 
-static std::filesystem::path detect_efi_boot_partition()
+static std::optional<std::string> get_partuuid_from_harddrive_device_path(auto_fd fd)
 {
-    int bc_fd = open("/sys/firmware/efi/efivars/BootCurrent-8be4df61-93ca-11d2-aa0d-00e098032b8c", O_RDONLY);
-    if (bc_fd < 0) throw std::runtime_error("Cannot access EFI vars(No efivarfs mounted?)"); // no efi firmware?
-    uint16_t boot_current = 0;
-    try {
-        read<uint32_t>(bc_fd); // skip 4 bytes
-        boot_current = read_le16(bc_fd); // current boot #
-    }
-    catch (...) {
-        close(bc_fd);
-        throw;
-    }
-    close(bc_fd);
+    auto partition_number = read_le32(fd);
+    read_le64(fd); // partition_start
+    read_le64(fd); // partition_size
 
-    char bootvarpath[80];
-    if (sprintf(bootvarpath, "/sys/firmware/efi/efivars/Boot%04X-8be4df61-93ca-11d2-aa0d-00e098032b8c", boot_current) < 0) {
-        throw std::runtime_error("sprintf()");
-    }
-    //else
-    int fd = open(bootvarpath, O_RDONLY);
-    if (fd < 0) throw std::runtime_error("Cannot access EFI boot option");
-    //else
-    std::optional<std::string> partuuid;
-    try {
-        read<uint32_t>(fd); // skip 4 bytes
-        read_le32(fd); // some flags
-        read_le16(fd); // length of path list
-        while (read_le16(fd) != 0x0000) { ; } // description
+    struct mbr_signature_t {
+        uint32_t u32le;
+        uint8_t padding[12];
+    };
 
-        while(!partuuid) {
-            uint8_t type, subtype;
-            type = read<uint8_t>(fd);
-            subtype = read<uint8_t>(fd);
-            if (type == 0x7f && subtype == 0xff) break; // end of device path
-            // else
-            auto struct_len = read_le16(fd);
-            if (struct_len < 4) throw std::runtime_error("Invalid structure(length must not be less than 4)");
-            if (type != 0x04/*MEDIA_DEVICE_PATH*/ || subtype != 0x01/*MEDIA_HARDDRIVE_DP*/) {
-                ssize_t skip_len = struct_len - 4; 
-                uint8_t buf[skip_len];
-                if (read(fd, buf, skip_len) != skip_len)
-                    throw std::runtime_error("Boundary exceeded(EFI bug?)");
-                //else
-                continue;
-            }
-            //else
-            auto partition_number = read_le32(fd);
-            read<uint64_t>(fd); // partition_start
-            read<uint64_t>(fd); // partition_size
-            uint8_t signature[16];
-            for (size_t i = 0; i < sizeof(signature); i++) {
-                signature[i] = read<uint8_t>(fd);
-            }
-            read<uint8_t>(fd); // mbrtype
-            auto signaturetype = read<uint8_t>(fd);
-            if (signaturetype == 1/*mbr*/) {
-                uint32_t u32lebuf =
-                    ((uint32_t)signature[0]) | ((uint32_t)signature[1] << 8) 
-                    | ((uint32_t)signature[2] << 16) | ((uint32_t)signature[3] << 24);
-                char buf[16];
-                if (sprintf(buf, "%08x-%02d", u32lebuf, (int)partition_number) < 0) {
-                    throw std::runtime_error("sprintf()");
-                }
-                //else
-                partuuid = buf;
-            } else if (signaturetype == 2/*gpt*/) {
-                uint32_t u32lebuf =
-                    ((uint32_t)signature[0]) | ((uint32_t)signature[1] << 8) 
-                    | ((uint32_t)signature[2] << 16) | ((uint32_t)signature[3] << 24);
-                uint16_t u16lebuf1 =
-                    ((uint16_t)signature[4]) | ((uint16_t)signature[5] << 8);
-                uint16_t u16lebuf2 =
-                    ((uint16_t)signature[6]) | ((uint16_t)signature[7] << 8);
-                uint16_t u16bebuf1 =
-                    ((uint16_t)signature[8] << 8) | ((uint16_t)signature[9]);
-                uint16_t u16bebuf2 =
-                    ((uint16_t)signature[10] << 8) | ((uint16_t)signature[11]);
-                uint32_t u32bebuf =
-                    ((uint32_t)signature[12] << 24) | ((uint32_t)signature[13] << 16) 
-                    | ((uint32_t)signature[14] << 8) | ((uint32_t)signature[15]);
-                char buf[40];
-                if (sprintf(buf, "%08x-%04x-%04x-%04x-%04x%08x", 
-                    u32lebuf, u16lebuf1, u16lebuf2, u16bebuf1, u16bebuf2, u32bebuf) < 0) {
-                    throw std::runtime_error("sprintf()");
-                }
-                //else
-                partuuid = buf;
-            }
+    struct gpt_signature_t {
+        uint32_t u32le;
+        uint16_t u16le1, u16le2, u16be1, u16be2;
+        uint32_t u32be;
+    };
+
+    union signature_t {
+        mbr_signature_t mbr;
+        gpt_signature_t gpt;
+    };
+
+    signature_t signature;
+    static_assert(sizeof(signature) == 16);
+
+    read(fd, &signature, sizeof(signature));
+    read<uint8_t>(fd); // mbrtype
+    auto signaturetype = read<uint8_t>(fd);
+    if (signaturetype == 1/*mbr*/) {
+        char buf[16];
+        if (sprintf(buf, "%08x-%02d", le32toh(signature.mbr.u32le), (int)partition_number) < 0) {
+            throw std::runtime_error("sprintf() failed");
         }
+        //else
+        return buf;
     }
-    catch (...) {
-        close(fd);
-        throw;
+    //else
+    if (signaturetype == 2/*gpt*/) {
+        char buf[40];
+        if (sprintf(buf, "%08x-%04x-%04x-%04x-%04x%08x", 
+            le32toh(signature.gpt.u32le), le16toh(signature.gpt.u16le1), le16toh(signature.gpt.u16le2),
+            be16toh(signature.gpt.u16be1), be16toh(signature.gpt.u16be2), be32toh(signature.gpt.u32be)) < 0) {
+            throw std::runtime_error("sprintf() failed");
+        }
+        //else
+        return buf;
     }
-    close(fd);
+    //else
+    return {};
+}
+
+static std::filesystem::path detect_efi_boot_partition(
+    const std::filesystem::path& efivars_dir = "/sys/firmware/efi/efivars")
+{
+    uint16_t boot_current = [&efivars_dir]() {
+        auto_fd fd = open(efivars_dir / "BootCurrent-8be4df61-93ca-11d2-aa0d-00e098032b8c");
+        if (!fd) throw std::runtime_error("Cannot access EFI vars(No efivarfs mounted?)"); // no efi firmware?
+        read_le32(fd); // variable attributes
+        return read_le16(fd); // current boot #
+    }();
+
+    char bootvar[80];
+    if (sprintf(bootvar, "Boot%04X-8be4df61-93ca-11d2-aa0d-00e098032b8c", boot_current) < 0) {
+        throw std::runtime_error("sprintf() failed(how come this could happen?)");
+    }
+    //else
+    auto_fd fd = open(efivars_dir / bootvar);
+    if (!fd) throw std::runtime_error("Cannot access EFI boot option " + std::to_string(boot_current));
+
+    read_le32(fd); // variable attributes
+    read_le32(fd); // some flags
+    read_le16(fd); // length of path list
+    while (read_le16(fd) != 0x0000) { ; } // description
+
+    std::optional<std::string> partuuid;
+    while(!partuuid) {  // parse device tree until what we're looking for found
+        uint8_t type, subtype;
+        type = read<uint8_t>(fd);
+        subtype = read<uint8_t>(fd);
+        if (type == 0x7f/*END_DEVICE_PATH_TYPE*/ && subtype == 0xff/*END_ENTIRE_DEVICE_PATH_SUBTYPE*/)
+            break; // reached to the end of device path
+        // else
+        auto struct_len = read_le16(fd);
+        if (struct_len < 4) throw std::runtime_error("Invalid structure(length must not be less than 4)");
+        if (type != 0x04/*MEDIA_DEVICE_PATH*/ || subtype != 0x01/*MEDIA_HARDDRIVE_DP*/) {
+            ssize_t skip_len = struct_len - 4; 
+            uint8_t buf[skip_len];
+            read(fd, buf, skip_len); // skip this part
+            continue;
+        }
+        //else
+        partuuid = get_partuuid_from_harddrive_device_path(fd);
+    }
     if (!partuuid) throw std::runtime_error("Partition not found in device path");
     //else
     auto partition = search_partition("PARTUUID", *partuuid);
